@@ -42,6 +42,23 @@ One Python file. No pip installs. No Electron. Just `adb` + the standard library
 - **Multi-select** with checkboxes → download or delete a batch
 - View & sort preferences remembered across sessions
 
+**Clone storage (backup / restore)**
+- **💾 Backup**: copy the phone's *entire* shared storage (photos, videos,
+  downloads, WhatsApp media, documents — everything under `/sdcard`) into a
+  dated folder on the Mac, picked with the native folder dialog
+- **📲 Restore**: push a saved backup onto a (new) phone — perfect for
+  phone-to-phone migration; apps are easy to reinstall, storage is not
+- Live progress the whole way: bytes copied / total, transfer speed, ETA,
+  file counter, and the file currently being copied — plus a running badge on
+  the sidebar button and in the tab title if you hide the dialog
+- Streams a single device-side `tar` over ADB (no per-file overhead, ~30 MB/s
+  on USB), preserving folder structure and file timestamps
+- Locked files (e.g. under `Android/data`, skipped by default) are logged to
+  `errors.log` and skipped instead of aborting; every backup gets a
+  `manifest.json` (source device, date, counts) that the restore screen shows
+  before pushing anything
+- Stop button any time — everything copied so far is kept
+
 **Housekeeping**
 - Rename, delete, new folder, free-space display
 - Protected-path guard (won't let you `rm -rf /sdcard`)

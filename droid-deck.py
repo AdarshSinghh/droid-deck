@@ -174,6 +174,313 @@ def disk_free(serial, path):
     return None
 
 
+# ---------- storage clone (backup / restore) ----------
+# One job at a time. Backup streams a device-side `tar -c` over `adb shell -T`
+# (shell v2 keeps stdout binary-safe and stderr separate) into a local `tar -x`;
+# restore is the same pipe reversed. Unreadable files are logged and skipped.
+CLONE_LOCK = threading.Lock()
+CLONE_JOB = None
+CLONE_EXCLUDES = ("./Android/data", "./Android/data/*",
+                  "./Android/obb", "./Android/obb/*")
+
+
+def new_clone_job(kind, serial, root):
+    return {"kind": kind, "serial": serial, "root": root, "state": "running",
+            "phase": "starting", "dest": None, "src": None,
+            "bytes_done": 0, "bytes_total": 0, "files_done": 0, "files_total": 0,
+            "current": "", "errors": [], "errors_total": 0, "error": None,
+            "note": "", "started": time.time(), "finished": None,
+            "_cancel": False, "_procs": []}
+
+
+def job_public(job):
+    if not job:
+        return None
+    d = {k: job[k] for k in (
+        "kind", "state", "phase", "serial", "root", "dest", "src",
+        "bytes_done", "bytes_total", "files_done", "files_total",
+        "current", "errors_total", "error", "note", "started", "finished")}
+    d["errors_tail"] = job["errors"][-6:]
+    return d
+
+
+def clone_finish(job, state):
+    job["state"] = state
+    job["phase"] = ""
+    job["current"] = ""
+    job["finished"] = time.time()
+    for p in job["_procs"]:
+        if p.poll() is None:
+            p.kill()
+
+
+def _tar_stderr_reader(pipe, job, names, count=True):
+    """Drain a tar stderr. With names=True (the verbose `-cv` side), non-error
+    lines are the files being copied; everything tar-flagged is an error.
+    count=False shows names without counting them (bsdtar lists directories
+    indistinguishably from files, so its counts would be wrong)."""
+    for raw in iter(pipe.readline, b""):
+        line = raw.decode("utf-8", "replace").rstrip()
+        if not line:
+            continue
+        if names and not line.startswith("tar:"):
+            n = line[2:] if line.startswith("a ") else line   # bsdtar prefixes 'a '
+            n = n[2:] if n.startswith("./") else n
+            if n and not n.endswith("/"):
+                if count:
+                    job["files_done"] += 1
+                job["current"] = n
+        else:
+            job["errors_total"] += 1
+            if len(job["errors"]) < 400:
+                job["errors"].append(line)
+    try:
+        pipe.close()
+    except OSError:
+        pass
+
+
+def _pump(src, dst, job):
+    """Move bytes src→dst counting progress. False if cancelled."""
+    while True:
+        if job["_cancel"]:
+            return False
+        chunk = src.read(1 << 20)
+        if not chunk:
+            return True
+        dst.write(chunk)
+        job["bytes_done"] += len(chunk)
+
+
+def clone_measure_device(serial, root, include_android_data):
+    """Bytes + file count under root, honouring the Android/data exclusion."""
+    r = root.rstrip("/")
+    rc, out, _ = adb_run(serial, "shell",
+                         f"du -sk {sh_quote(r)} 2>/dev/null | tail -n1",
+                         timeout=1800)
+    try:
+        total_kb = int(out.split()[0])
+    except (ValueError, IndexError):
+        total_kb = 0
+    if include_android_data:
+        find_cmd = f"find {sh_quote(r)}/ -type f 2>/dev/null | wc -l"
+    else:
+        rc, out2, _ = adb_run(
+            serial, "shell",
+            f"du -sk {sh_quote(r + '/Android/data')} "
+            f"{sh_quote(r + '/Android/obb')} 2>/dev/null", timeout=900)
+        for line in out2.splitlines():
+            try:
+                total_kb -= int(line.split()[0])
+            except (ValueError, IndexError):
+                pass
+        find_cmd = (f"find {sh_quote(r)}/ \\( -path {sh_quote(r + '/Android/data')} "
+                    f"-o -path {sh_quote(r + '/Android/obb')} \\) -prune "
+                    f"-o -type f -print 2>/dev/null | wc -l")
+    rc, out3, _ = adb_run(serial, "shell", find_cmd, timeout=1800)
+    try:
+        files = int(out3.split()[0])
+    except (ValueError, IndexError):
+        files = 0
+    return max(total_kb, 0) * 1024, files
+
+
+def _local_tree_size(top):
+    files = size = 0
+    for dirpath, _dirs, names in os.walk(top):
+        for n in names:
+            try:
+                size += os.path.getsize(os.path.join(dirpath, n))
+                files += 1
+            except OSError:
+                pass
+    return size, files
+
+
+def clone_backup_worker(job):
+    serial, root = job["serial"], job["root"]
+    try:
+        job["phase"] = "measuring phone storage (takes a minute on big phones)"
+        b, f = clone_measure_device(serial, root, job["include_android_data"])
+        job["bytes_total"], job["files_total"] = b, f
+        if job["_cancel"]:
+            return clone_finish(job, "cancelled")
+        free = shutil.disk_usage(os.path.dirname(job["backup_dir"])).free
+        if b and free < b * 1.02:
+            job["error"] = (f"not enough space on the Mac: backup needs about "
+                            f"{b // 2**30} GB, destination has {free // 2**30} GB free")
+            return clone_finish(job, "error")
+        os.makedirs(job["storage_dir"], exist_ok=True)
+
+        job["phase"] = "copying from phone"
+        ex = "" if job["include_android_data"] else \
+            " ".join("--exclude " + sh_quote(p) for p in CLONE_EXCLUDES) + " "
+        remote = f"tar -cvf - {ex}-C {sh_quote(root)} ."
+        p_dev = subprocess.Popen([ADB, "-s", serial, "shell", "-T", remote],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p_tar = subprocess.Popen(["/usr/bin/tar", "-xpf", "-", "-C", job["storage_dir"]],
+                                 stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        job["_procs"] = [p_dev, p_tar]
+        threading.Thread(target=_tar_stderr_reader,
+                         args=(p_dev.stderr, job, True), daemon=True).start()
+        threading.Thread(target=_tar_stderr_reader,
+                         args=(p_tar.stderr, job, False), daemon=True).start()
+        ok = True
+        try:
+            ok = _pump(p_dev.stdout, p_tar.stdin, job)
+        except (BrokenPipeError, OSError):
+            ok = False
+        try:
+            p_tar.stdin.close()
+        except OSError:
+            pass
+        p_dev.wait()
+        tar_rc = p_tar.wait()
+        if job["_cancel"] or not ok:
+            if not job["_cancel"]:
+                job["error"] = "extraction stopped early — " + \
+                    ("; ".join(job["errors"][-2:]) or "is the Mac disk full?")
+            return clone_finish(job, "cancelled" if job["_cancel"] else "error")
+        if tar_rc != 0 and not os.listdir(job["storage_dir"]):
+            job["error"] = "nothing was extracted — " + \
+                ("; ".join(job["errors"][-2:]) or "device tar produced no data")
+            return clone_finish(job, "error")
+
+        job["phase"] = "verifying + writing manifest"
+        size, files = _local_tree_size(job["storage_dir"])
+        job["files_done"] = files
+        job["bytes_total"] = job["bytes_done"]   # snap the bar to 100%
+        manifest = {
+            "app": "droid-deck", "kind": "phone-storage-backup",
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "device": {"serial": serial, **device_info(serial)},
+            "root": root,
+            "include_android_data": job["include_android_data"],
+            "files": files, "bytes": size,
+            "files_expected": job["files_total"] or None,
+            "skipped_or_errors": job["errors_total"],
+            "duration_s": round(time.time() - job["started"]),
+        }
+        with open(os.path.join(job["backup_dir"], "manifest.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, ensure_ascii=False)
+        if job["errors"]:
+            with open(os.path.join(job["backup_dir"], "errors.log"), "w",
+                      encoding="utf-8") as fh:
+                fh.write("\n".join(job["errors"]) + "\n")
+                if job["errors_total"] > len(job["errors"]):
+                    fh.write(f"... and {job['errors_total'] - len(job['errors'])} more\n")
+        job["note"] = f"{files:,} files saved"
+        if job["errors_total"]:
+            job["note"] += f", {job['errors_total']:,} skipped (see errors.log)"
+        clone_finish(job, "done")
+    except Exception as e:                          # noqa: BLE001 — job must not die silently
+        job["error"] = f"{type(e).__name__}: {e}"
+        clone_finish(job, "error")
+
+
+def clone_restore_worker(job):
+    serial, root = job["serial"], job["root"]
+    try:
+        job["phase"] = "checking free space on phone"
+        df = disk_free(serial, root)
+        if df and df["free_kb"] * 1024 < job["bytes_total"] * 1.02:
+            job["error"] = (f"not enough free space on the phone: needs about "
+                            f"{job['bytes_total'] // 2**30} GB, "
+                            f"{df['free_kb'] * 1024 // 2**30} GB free")
+            return clone_finish(job, "error")
+        if job["_cancel"]:
+            return clone_finish(job, "cancelled")
+
+        job["phase"] = "copying to phone"
+        # COPYFILE_DISABLE stops bsdtar smuggling AppleDouble ._* metadata
+        # files into the archive (they'd land on the phone as junk).
+        p_tar = subprocess.Popen(
+            ["/usr/bin/tar", "--exclude", "._*", "--exclude", "*/._*",
+             "-cvf", "-", "-C", job["storage_dir"], "."],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={**os.environ, "COPYFILE_DISABLE": "1"})
+        p_dev = subprocess.Popen(
+            [ADB, "-s", serial, "shell", "-T", f"tar -xf - -C {sh_quote(root)}"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE)
+        job["_procs"] = [p_tar, p_dev]
+        threading.Thread(target=_tar_stderr_reader,
+                         args=(p_tar.stderr, job, True, False), daemon=True).start()
+        threading.Thread(target=_tar_stderr_reader,
+                         args=(p_dev.stderr, job, False), daemon=True).start()
+        ok = True
+        try:
+            ok = _pump(p_tar.stdout, p_dev.stdin, job)
+        except (BrokenPipeError, OSError):
+            ok = False
+        try:
+            p_dev.stdin.close()
+        except OSError:
+            pass
+        p_tar.wait()
+        dev_rc = p_dev.wait()
+        if job["_cancel"] or not ok:
+            if not job["_cancel"]:
+                job["error"] = "the phone stopped accepting data — " + \
+                    ("; ".join(job["errors"][-2:]) or "cable unplugged?")
+            return clone_finish(job, "cancelled" if job["_cancel"] else "error")
+        if dev_rc != 0 and job["bytes_done"] == 0:
+            job["error"] = "; ".join(job["errors"][-2:]) or "device tar failed"
+            return clone_finish(job, "error")
+
+        job["phase"] = "asking the phone to re-index media"
+        adb_run(serial, "shell",
+                f"cmd media scan {sh_quote(root)} >/dev/null 2>&1", timeout=30)
+        job["bytes_total"] = job["bytes_done"]
+        job["files_done"] = job["files_total"]
+        job["note"] = ("restore complete — reboot the phone so Gallery/Music "
+                       "pick up everything")
+        clone_finish(job, "done")
+    except Exception as e:                          # noqa: BLE001
+        job["error"] = f"{type(e).__name__}: {e}"
+        clone_finish(job, "error")
+
+
+def choose_folder(prompt):
+    """Native macOS folder picker. Returns (path|None, error|None);
+    (None, None) means the user cancelled."""
+    script = f"POSIX path of (choose folder with prompt {json.dumps(prompt)})"
+    try:
+        p = subprocess.run(["osascript", "-e", script],
+                           capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return None, "folder dialog timed out"
+    if p.returncode != 0:
+        if "-128" in p.stderr:                      # user pressed Cancel
+            return None, None
+        return None, p.stderr.strip() or "folder dialog failed"
+    return p.stdout.strip(), None
+
+
+def inspect_backup(path):
+    """Validate a backup folder for restore. Returns (info, error)."""
+    path = os.path.abspath(os.path.expanduser(path or ""))
+    if not os.path.isdir(path):
+        return None, "folder not found: " + path
+    manifest = None
+    mf = os.path.join(path, "manifest.json")
+    if os.path.isfile(mf):
+        try:
+            with open(mf, encoding="utf-8") as fh:
+                manifest = json.load(fh)
+        except (OSError, ValueError):
+            manifest = None
+    storage = os.path.join(path, "storage")
+    if not os.path.isdir(storage):
+        storage = path
+    size, files = _local_tree_size(storage)
+    if files == 0:
+        return None, "that folder is empty — pick the dated backup folder"
+    return {"path": path, "storage": storage, "manifest": manifest,
+            "bytes": size, "files": files}, None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "droid-deck/1.0"
 
@@ -279,10 +586,103 @@ class Handler(BaseHTTPRequestHandler):
                     return self.fail("serial required")
                 self.stream_exec_out(serial, "screencap -p", "image/png")
 
+            elif route == "/api/clone/status":
+                with CLONE_LOCK:
+                    j = job_public(CLONE_JOB)
+                self.send_json({"job": j})
+
+            elif route == "/api/clone/df":
+                serial = q.get("serial")
+                if not serial:
+                    return self.fail("serial required")
+                self.send_json({"df": disk_free(serial, q.get("path", "/sdcard"))})
+
             else:
                 self.fail("not found", 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def handle_clone(self, route):
+        global CLONE_JOB
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length).decode()) if length else {}
+        except (ValueError, UnicodeDecodeError):
+            return self.fail("bad json")
+
+        if route == "/api/clone/choose":
+            path, err = choose_folder(payload.get("prompt") or "Choose a folder")
+            if err:
+                return self.fail(err, 500)
+            return self.send_json({"path": path})   # path=None → user cancelled
+
+        if route == "/api/clone/inspect":
+            info, err = inspect_backup(payload.get("path"))
+            if err:
+                return self.fail(err)
+            serial = payload.get("serial")
+            info["df"] = disk_free(serial, payload.get("root") or "/sdcard") \
+                if serial else None
+            return self.send_json(info)
+
+        if route == "/api/clone/cancel":
+            with CLONE_LOCK:
+                job = CLONE_JOB
+            if not job or job["state"] != "running":
+                return self.fail("no running clone job")
+            job["_cancel"] = True
+            for p in job["_procs"]:
+                if p.poll() is None:
+                    p.kill()
+            return self.send_json({"ok": True})
+
+        if route == "/api/clone/reveal":
+            p = payload.get("path")
+            if not p or not os.path.exists(p):
+                return self.fail("path missing")
+            subprocess.Popen(["open", p])
+            return self.send_json({"ok": True})
+
+        if route == "/api/clone/start":
+            mode, serial = payload.get("mode"), payload.get("serial")
+            root = payload.get("root") or "/sdcard"
+            if mode not in ("backup", "restore") or not serial:
+                return self.fail("mode and serial required")
+            with CLONE_LOCK:
+                if CLONE_JOB and CLONE_JOB["state"] == "running":
+                    return self.fail("a backup/restore is already running", 409)
+                job = new_clone_job(mode, serial, root)
+                if mode == "backup":
+                    dest = os.path.abspath(os.path.expanduser(payload.get("dest") or ""))
+                    if not os.path.isdir(dest):
+                        return self.fail("destination folder not found")
+                    name = device_info(serial)["name"]
+                    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or serial
+                    bdir = os.path.join(
+                        dest, f"{safe}-backup-{time.strftime('%Y%m%d-%H%M')}")
+                    n = 2
+                    while os.path.exists(bdir):
+                        bdir = f"{bdir}-{n}"
+                        n += 1
+                    job.update(backup_dir=bdir,
+                               storage_dir=os.path.join(bdir, "storage"),
+                               dest=bdir,
+                               include_android_data=bool(
+                                   payload.get("include_android_data")))
+                    worker = clone_backup_worker
+                else:
+                    info, err = inspect_backup(payload.get("src"))
+                    if err:
+                        return self.fail(err)
+                    job.update(storage_dir=info["storage"], src=info["path"],
+                               bytes_total=info["bytes"],
+                               files_total=info["files"])
+                    worker = clone_restore_worker
+                CLONE_JOB = job
+            threading.Thread(target=worker, args=(job,), daemon=True).start()
+            return self.send_json({"ok": True, "job": job_public(job)})
+
+        self.fail("not found", 404)
 
     def do_POST(self):
         route = urllib.parse.urlparse(self.path).path
@@ -292,6 +692,9 @@ class Handler(BaseHTTPRequestHandler):
             # nudge adb: revive offline transports, then rescan
             adb_run(None, "reconnect", "offline", timeout=10)
             return self.send_json({"ok": True, "devices": list_devices()})
+
+        if route.startswith("/api/clone/"):
+            return self.handle_clone(route)
 
         serial = q.get("serial")
         if not serial:
@@ -621,6 +1024,42 @@ body.selecting .gcard .check { opacity: 1; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinning { display: inline-block; animation: spin 1s linear infinite; }
 
+/* ---------- clone overlay ---------- */
+#clone {
+  position: fixed; inset: 0; z-index: 75; display: none; place-items: center;
+  background: rgba(13,17,23,.6);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+}
+#clone.on { display: grid; }
+.clonecard {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+  padding: 24px 28px; width: min(620px, 94vw);
+  box-shadow: 0 20px 60px rgba(0,0,0,.6); animation: pop .18s ease-out;
+}
+.clonecard h3 { margin-bottom: 4px; }
+.clonecard .sub { color: var(--dim); font-size: .85rem; margin-bottom: 14px;
+  line-height: 1.45; }
+.ctbl { width: 100%; font-size: .85rem; margin-bottom: 12px; border-collapse: collapse; }
+.ctbl td { padding: 5px 8px 5px 0; border: 0; vertical-align: top;
+  word-break: break-all; }
+.ctbl td:first-child { color: var(--dim); white-space: nowrap; width: 96px; }
+.bar { height: 12px; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 7px; overflow: hidden; margin: 12px 0 4px; }
+.bar div { height: 100%; width: 0%; border-radius: 6px;
+  background: linear-gradient(90deg, #1f7a3f, var(--accent)); transition: width .5s; }
+.bar.busy div { width: 30%; animation: slide 1.2s ease-in-out infinite alternate; }
+@keyframes slide { from { margin-left: 0 } to { margin-left: 70% } }
+.cstats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+  margin: 10px 0; font-size: .72rem; color: var(--dim); text-align: center; }
+.cstats b { display: block; color: var(--text); font-size: .95rem; margin-bottom: 2px;
+  font-variant-numeric: tabular-nums; }
+.ccur { font-size: .74rem; color: var(--dim); word-break: break-all; min-height: 2.1em; }
+#cerr { max-height: 130px; overflow: auto; font-size: .72rem; color: var(--danger);
+  white-space: pre-wrap; margin-top: 8px; display: none;
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+.cbtns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+.cwarn { color: var(--danger); font-size: .8rem; margin: 6px 0; }
+
 /* ---------- toasts ---------- */
 #toasts { position: fixed; right: 18px; bottom: 18px; z-index: 70;
   display: flex; flex-direction: column; gap: 8px; }
@@ -660,6 +1099,16 @@ body.selecting .gcard .check { opacity: 1; }
   <div class="card">
     <h2>Quick locations</h2>
     <div class="quick" id="quick"></div>
+  </div>
+
+  <div class="card">
+    <h2>Clone storage</h2>
+    <div class="row" style="margin-top:0">
+      <button class="btn primary" id="bkbtn">💾 Backup</button>
+      <button class="btn" id="rsbtn">📲 Restore</button>
+    </div>
+    <div class="devmeta">Copy the phone's entire shared storage into a Mac
+    folder, or push a saved backup onto a new phone.</div>
   </div>
 
   <div class="card">
@@ -741,6 +1190,8 @@ body.selecting .gcard .check { opacity: 1; }
     <div class="hint">Auto-retrying every 3 s — check the USB cable / debugging prompt</div>
   </div>
 </div>
+
+<div id="clone"><div class="clonecard" id="cbody"></div></div>
 
 <div id="toasts"></div>
 
@@ -1240,6 +1691,209 @@ async function screenshot() {
   };
 }
 
+/* ---------- storage clone (backup / restore) ---------- */
+let lastCloneJob = null, clonePrev = null, cloneSpeed = 0;
+
+const jpost = (url, obj) => api(url, { method: "POST",
+  headers: { "Content-Type": "application/json" }, body: JSON.stringify(obj) });
+const fmtDur = s => {
+  s = Math.max(0, Math.round(s));
+  const h = s / 3600 | 0, m = (s % 3600) / 60 | 0;
+  return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
+};
+function cloneOpen(html) { $("cbody").innerHTML = html; $("clone").classList.add("on"); }
+function cloneClose() { $("clone").classList.remove("on"); }
+
+async function chooseFolder(prompt) {
+  toast("Check the folder dialog — it may open behind this window…");
+  const j = await jpost("/api/clone/choose", { prompt });
+  return j.path;
+}
+
+async function beginBackup() {
+  if (!state.serial) return toast("No device", "err");
+  let dest;
+  try { dest = await chooseFolder("Where should the phone backup be saved?"); }
+  catch (e) { return toast(e.message, "err"); }
+  if (!dest) return;
+  const d = (state.devices || []).find(x => x.serial === state.serial) || {};
+  cloneOpen(`
+    <h3>💾 Backup phone → Mac</h3>
+    <div class="sub">Copies the phone's entire shared storage — photos, videos,
+      downloads, WhatsApp media, documents — into a new dated folder.
+      Apps themselves are not included, storage only.</div>
+    <table class="ctbl">
+      <tr><td>Phone</td><td><b>${esc(devLabel(d) || state.serial)}</b> · <span class="mono">/sdcard</span></td></tr>
+      <tr><td>Save into</td><td class="mono">${esc(dest)}</td></tr>
+      <tr><td>Size</td><td id="cdf">measuring…</td></tr>
+    </table>
+    <label style="font-size:.8rem;color:var(--dim);display:flex;gap:7px;align-items:flex-start">
+      <input type="checkbox" id="incdata" class="check" style="margin-top:2px">
+      <span>Also try <span class="mono">Android/data</span> + <span class="mono">obb</span>
+      (app-private files — many are locked by Android and will be skipped with errors)</span>
+    </label>
+    <div class="cbtns">
+      <button class="btn" id="cno">Cancel</button>
+      <button class="btn primary" id="cgo">Start backup</button>
+    </div>`);
+  api(`/api/clone/df?serial=${encodeURIComponent(state.serial)}&path=/sdcard`)
+    .then(j => { if (j.df && $("cdf")) $("cdf").textContent =
+      `up to ${human(j.df.used_kb * 1024)} — exact size is measured when it starts`; })
+    .catch(() => { if ($("cdf")) $("cdf").textContent = "unknown"; });
+  $("cno").onclick = cloneClose;
+  $("cgo").onclick = () => startClone({ mode: "backup", serial: state.serial,
+    dest, include_android_data: $("incdata").checked });
+}
+
+async function beginRestore() {
+  if (!state.serial) return toast("No device", "err");
+  let src;
+  try { src = await chooseFolder("Pick the backup folder (the dated one that contains manifest.json)"); }
+  catch (e) { return toast(e.message, "err"); }
+  if (!src) return;
+  let ins;
+  try { ins = await jpost("/api/clone/inspect", { path: src, serial: state.serial }); }
+  catch (e) { return toast(e.message, "err"); }
+  const d = (state.devices || []).find(x => x.serial === state.serial) || {};
+  const m = ins.manifest;
+  const free = ins.df ? ins.df.free_kb * 1024 : null;
+  const tooSmall = free !== null && free < ins.bytes * 1.02;
+  cloneOpen(`
+    <h3>📲 Restore backup → phone</h3>
+    <div class="sub">Pushes the backup into the phone's storage. Files that
+      already exist under the same names are overwritten.</div>
+    <table class="ctbl">
+      <tr><td>Backup</td><td class="mono">${esc(ins.path)}</td></tr>
+      ${m ? `<tr><td>Made from</td><td><b>${esc(m.device && (m.device.name || m.device.serial) || "?")}</b> on ${esc(m.created || "?")}</td></tr>`
+          : `<tr><td></td><td class="cwarn">⚠ No manifest.json — not made by droid-deck; the folder's contents will be pushed as-is into /sdcard.</td></tr>`}
+      <tr><td>Contents</td><td>${ins.files.toLocaleString()} files · ${human(ins.bytes)}</td></tr>
+      <tr><td>Onto phone</td><td><b>${esc(devLabel(d) || state.serial)}</b>${free !== null ? ` · ${human(free)} free` : ""}</td></tr>
+    </table>
+    ${tooSmall ? `<div class="cwarn">⚠ Not enough free space on the phone for this backup.</div>` : ""}
+    <div class="cbtns">
+      <button class="btn" id="cno">Cancel</button>
+      <button class="btn primary" id="cgo" ${tooSmall ? "disabled" : ""}>Start restore</button>
+    </div>`);
+  $("cno").onclick = cloneClose;
+  $("cgo").onclick = () => startClone({ mode: "restore", serial: state.serial, src });
+}
+
+async function startClone(payload) {
+  try {
+    const j = await jpost("/api/clone/start", payload);
+    clonePrev = null; cloneSpeed = 0;
+    renderCloneRun(j.job, true);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function renderCloneRun(job, fresh) {
+  if (fresh || !$("cbar")) {
+    cloneOpen(`
+      <h3 id="chead"></h3>
+      <div class="sub" id="cphase"></div>
+      <div class="bar" id="cbarw"><div id="cbar"></div></div>
+      <div class="cstats">
+        <div><b id="cbytes">—</b>copied</div>
+        <div><b id="cspeed">—</b>speed</div>
+        <div><b id="ceta">—</b>time left</div>
+        <div><b id="cfiles">—</b>files</div>
+      </div>
+      <div class="ccur" id="ccur"></div>
+      <div style="font-size:.78rem" id="cerrline" hidden>⚠ <span id="cerrn"></span>
+        file(s) skipped — <a href="#" id="cerrshow" style="color:var(--accent2)">details</a></div>
+      <pre id="cerr"></pre>
+      <div class="cbtns" id="cctl"></div>`);
+    $("cerrshow").onclick = e => { e.preventDefault();
+      $("cerr").style.display = $("cerr").style.display === "block" ? "none" : "block"; };
+  }
+  updateCloneRun(job);
+}
+
+function updateCloneRun(job) {
+  if (!job || !$("cbar")) return;
+  const running = job.state === "running";
+  const pct = job.bytes_total
+    ? Math.min(100, job.bytes_done / job.bytes_total * 100) : 0;
+  $("chead").textContent =
+    (job.kind === "backup" ? "💾 Backing up" : "📲 Restoring") +
+    (running ? "…" : "");
+  $("cbarw").classList.toggle("busy", running && !job.bytes_total);
+  $("cbar").style.width = (job.state === "done" ? 100 : pct) + "%";
+
+  const now = performance.now() / 1000;
+  if (clonePrev && job.bytes_done > clonePrev.bytes && now > clonePrev.t)
+    cloneSpeed = cloneSpeed * .6 +
+      ((job.bytes_done - clonePrev.bytes) / (now - clonePrev.t)) * .4;
+  clonePrev = { t: now, bytes: job.bytes_done };
+  const left = cloneSpeed > 1 && job.bytes_total > job.bytes_done
+    ? (job.bytes_total - job.bytes_done) / cloneSpeed : null;
+
+  $("cbytes").textContent = human(job.bytes_done) +
+    (job.bytes_total ? " / " + human(job.bytes_total) : "");
+  $("cspeed").textContent = running && cloneSpeed > 1 ? human(cloneSpeed) + "/s" : "—";
+  $("ceta").textContent = running ? (left ? "~" + fmtDur(left) : "…")
+    : fmtDur((job.finished || job.started) - job.started);
+  const fd = job.files_done ||    // restore counts by bytes, so estimate
+    (job.kind === "restore" && job.bytes_total
+      ? Math.round(job.files_total * job.bytes_done / job.bytes_total) : 0);
+  $("cfiles").textContent = fd.toLocaleString() +
+    (job.files_total ? " / " + job.files_total.toLocaleString() : "");
+  $("ccur").textContent = running ? (job.current || "") : "";
+  $("cphase").textContent =
+    running ? (job.phase || "working") + (pct ? ` · ${pct.toFixed(1)}%` : "")
+    : job.state === "done" ? "✓ Finished" + (job.note ? " — " + job.note : "")
+    : job.state === "cancelled" ? "Stopped — everything copied so far was kept"
+    : "✗ Failed — " + (job.error || "unknown error");
+
+  if (job.errors_total) {
+    $("cerrline").hidden = false;
+    $("cerrn").textContent = job.errors_total.toLocaleString();
+    $("cerr").textContent = (job.errors_tail || []).join("\n") +
+      (job.errors_total > (job.errors_tail || []).length
+        ? "\n… full list saved to errors.log in the backup folder" : "");
+  }
+
+  const ctl = $("cctl");
+  if (running) {
+    if (!$("cstop")) {
+      ctl.innerHTML = `<button class="btn danger" id="cstop">■ Stop</button>
+        <button class="btn" id="chide">Hide</button>`;
+      $("cstop").onclick = async () => {
+        if (!confirm("Stop the copy? Everything copied so far is kept.")) return;
+        try { await jpost("/api/clone/cancel", {}); } catch (e) { toast(e.message, "err"); }
+      };
+      $("chide").onclick = cloneClose;
+    }
+  } else if (!$("cok")) {
+    ctl.innerHTML =
+      (job.kind === "backup" && job.state === "done"
+        ? `<button class="btn" id="creveal">📂 Show in Finder</button>` : "") +
+      `<button class="btn primary" id="cok">Close</button>`;
+    if ($("creveal")) $("creveal").onclick = () =>
+      jpost("/api/clone/reveal", { path: job.dest }).catch(e => toast(e.message, "err"));
+    $("cok").onclick = cloneClose;
+  }
+}
+
+async function pollClone() {
+  let j;
+  try { j = await api("/api/clone/status"); } catch (e) { return; }
+  const job = j.job;
+  const wasRunning = lastCloneJob && lastCloneJob.state === "running";
+  lastCloneJob = job;
+  const running = job && job.state === "running";
+  const pctTxt = running && job.bytes_total
+    ? Math.round(job.bytes_done / job.bytes_total * 100) + "%" : "…";
+  $("bkbtn").textContent = running && job.kind === "backup" ? "💾 " + pctTxt : "💾 Backup";
+  $("rsbtn").textContent = running && job.kind === "restore" ? "📲 " + pctTxt : "📲 Restore";
+  document.title = running ? `droid-deck — ${job.kind} ${pctTxt}` : "droid-deck";
+  if ($("clone").classList.contains("on")) updateCloneRun(job);
+  if (wasRunning && job && !running && !$("clone").classList.contains("on"))
+    toast(job.state === "done" ? `✓ ${job.kind} finished — ${job.note || ""}`
+      : `${job.kind} ${job.state}: ${job.error || ""}`,
+      job.state === "done" ? "ok" : "err");
+}
+
 /* ---------- send text ---------- */
 async function sendText(mode) {
   const text = $("sendtext").value;
@@ -1315,9 +1969,17 @@ window.addEventListener("drop", e => {
 });
 
 $("reconnect").onclick = reconnect;
+$("bkbtn").onclick = () =>
+  lastCloneJob && lastCloneJob.state === "running"
+    ? renderCloneRun(lastCloneJob, !$("cbar")) : beginBackup();
+$("rsbtn").onclick = () =>
+  lastCloneJob && lastCloneJob.state === "running"
+    ? renderCloneRun(lastCloneJob, !$("cbar")) : beginRestore();
 
 loadDevices();
 setInterval(checkAlive, 3000);
+setInterval(pollClone, 900);
+pollClone();
 </script>
 </body>
 </html>
